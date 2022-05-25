@@ -45,6 +45,7 @@ static int samplicate (struct samplicator_context *);
 static int make_udp_socket (long, int, int);
 static int make_recv_socket (struct samplicator_context *);
 static int make_send_sockets (struct samplicator_context *);
+static int inet_address_is_multicast (struct addrinfo *addr);
 
 int
 main (argc, argv)
@@ -104,6 +105,7 @@ write_pid_file (const char *filename)
     {
       fprintf (stderr, "Failed to write PID to PID file %s: %s\n",
 	       filename, strerror (errno));
+      fclose (fp);
       return -1;
     }
   if (fclose (fp) == EOF)
@@ -169,6 +171,7 @@ make_recv_socket (ctx)
 {
   struct addrinfo hints, *res;
   int result;
+  int multicast;
 
   init_hints_from_preferences (&hints, ctx);
   if ((result = getaddrinfo (ctx->faddr_spec, ctx->fport_spec, &hints, &res)) != 0)
@@ -177,6 +180,8 @@ make_recv_socket (ctx)
 	       ctx->faddr_spec, ctx->fport_spec, gai_strerror (result));
       return -1;
     }
+
+  multicast = inet_address_is_multicast(res);
   for (; res; res = res->ai_next)
     {
       if ((ctx->fsockfd = socket (res->ai_family, SOCK_DGRAM, 0)) < 0)
@@ -184,7 +189,16 @@ make_recv_socket (ctx)
 	  fprintf (stderr, "socket(): %s\n", strerror (errno));
 	  break;
 	}
-      if (setsockopt (ctx->fsockfd, SOL_SOCKET, SO_RCVBUF,
+      if (multicast)
+	{
+      int enable=1;
+        if (setsockopt(ctx->fsockfd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) < 0)
+	  {
+	    fprintf (stderr, "Warning: setsockopt(SO_REUSEADDR) failed: %s\n",
+	       strerror (errno));
+	  }
+	}
+      else if (setsockopt (ctx->fsockfd, SOL_SOCKET, SO_RCVBUF,
 		      (char *) &ctx->sockbuflen, sizeof ctx->sockbuflen) == -1)
 	{
 	  fprintf (stderr, "Warning: setsockopt(SO_RCVBUF,%ld) failed: %s\n",
@@ -196,9 +210,26 @@ make_recv_socket (ctx)
 	  fprintf (stderr, "bind(): %s\n", strerror (errno));
 	  break;
 	}
-      ctx->fsockaddrlen = res->ai_addrlen;
-      return 0;
+      if (multicast)
+	{
+	  struct ip_mreq mreq;
+	  // FIXME: Handle IPv6
+	  struct sockaddr_in *sock_addr = (struct sockaddr_in *)res->ai_addr;
+	  mreq.imr_multiaddr = sock_addr->sin_addr;
+	  mreq.imr_interface.s_addr = htonl(INADDR_ANY)	;
+
+	  /* Tell the kernel we want to join that multicast group. */
+        if (setsockopt(ctx->fsockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0)
+	  {
+	      fprintf (stderr, "Failed to join multicast group: %s\n", strerror (errno));
+	      break;
+	  }
+	}
+	ctx->fsockaddrlen = res->ai_addrlen;
+	freeaddrinfo(res);
+	return 0;
     }
+  freeaddrinfo(res);
   return -1;
 }
 
@@ -561,5 +592,28 @@ make_send_sockets (struct samplicator_context *ctx)
 	  receiver->fd = socks[spoof_p][af_index];
 	}
     }
+  return 0;
+}
+
+/**
+ * inet_address_is_multicast:
+ * @address: a struct addrinfo
+ *
+ * Tests whether @addr is a multicast address.
+ *
+ * Returns: 0 if @addr is not a multicast address.
+ */
+int
+inet_address_is_multicast (struct addrinfo *addr)
+{
+  if (addr->ai_family == AF_INET)
+	{
+	  return IN_MULTICAST(ntohl(((struct sockaddr_in *)addr->ai_addr)->sin_addr.s_addr));
+	}
+  if (addr->ai_family == AF_INET6)
+	{
+	  return IN6_IS_ADDR_MULTICAST(&((struct sockaddr_in6 *)addr->ai_addr)->sin6_addr);
+	}
+
   return 0;
 }
